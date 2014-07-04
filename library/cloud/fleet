@@ -1,0 +1,226 @@
+#!/usr/bin/python
+# This file is part of Ansible
+#
+# Ansible is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ansible is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+
+DOCUMENTATION = '''
+---
+module: fleet
+short_description: control fleet unit
+description:
+     - Control a fleet unit running in your CoreOS cluster 
+version_added: "1.7"
+options:
+  unit:
+    description:
+      - fleet unit name
+    required: true
+  endpoint:
+    description:
+      - URL of server running etcd
+    required: false
+  tunnel:
+    description:
+      - hostname to create SSH tunnel to
+    required: false
+  template:
+    description:
+      - jinja2 template of unit file to manage
+    required: false
+  template_parameters:
+    description:
+      - a list of hashes of all the template variables for the unit
+    required: false
+    default: {}
+  state:
+    description:
+      - desired state of fleet unit
+    required: false
+    default: active
+    choices: [ "active", "absent" ]
+
+requirements: [ "fleetctl" ]
+author: Louis Garman
+'''
+
+EXAMPLES = '''
+# Basic task example
+tasks:
+- name: ensure fleet unit is active
+  action: fleet >
+    unit="haproxy.service" state=active
+    template=templates/haproxy.service.j2
+    template_parameters:
+      name: haproxy.1
+'''
+
+def status(module):
+
+    units = dict()
+    listing = run_fleetctl(module, 'list-units')
+
+    for l in listing.splitlines():
+
+        if type(l) == str:
+            fields = re.split("\t+", l)
+
+            if len(fields) != 7 or fields[0] == 'UNIT':
+                continue
+
+            unit, state, load, active, sub, desc, machine = re.split("\t+", l)
+            units[unit] = dict(state=state, load=load, active=active,
+                    sub=sub, desc=desc, machine=machine)
+    return units
+
+
+def compare(module, unit, local):
+
+    local_unit = open(local).read()
+    remote_unit = run_fleetctl(module, 'cat', unit)
+
+#    print "<<LOCAL>>"
+#    print local_unit
+#    print "<<REMOTE>>"
+#    print stdout
+
+    if local_unit == remote_unit:
+        return True
+    else:
+        return False
+
+
+def wait_for(module, desired_state, unit):
+    while True:
+        units = status(module)
+
+        if unit in units:
+            if units[unit]['active'] == 'failed':
+                return module.fail_json(changed=False, msg='unit is in failed state')
+
+            if desired_state == 'active':
+                if units[unit]['active'] == 'active':
+                    return module.exit_json(changed=True, msg='unit now active', unit=unit)
+                else:
+                    sleep(1)
+
+            if desired_state == 'absent':
+                sleep(1)
+
+        else:
+            if desired_state == 'active':
+                return module.fail_json(msg="unit didn't submit")
+
+            if desired_state == 'absent':
+                return module.exit_json(changed=True, msg='unit now absent')
+
+
+def run_fleetctl(module, subcommand, unit=''):
+
+    cmd = "fleetctl"
+
+    if module.params['endpoint'] is not None:
+        cmd = cmd + " -endpoint %s" % (module.params['endpoint'])
+
+    if module.params['tunnel'] is not None:
+        cmd = cmd + " -tunnel %s" % (module.params['tunnel'])
+
+    cmd = cmd + " %s %s" % (subcommand, unit)
+
+    rc, stdout, stderr = module.run_command(cmd)
+    if rc == 0:
+        return stdout
+    else:
+        module.fail_json(msg=stderr, cmd=cmd)
+        sys.exit(1)
+
+
+def main():
+
+    module = AnsibleModule(
+        argument_spec = dict(
+            unit = dict(required=True),
+            state = dict(default='active', choices=['active','absent']),
+            template = dict(),
+            template_parameters = dict(required=False, type='dict', default={}),
+            endpoint = dict(),
+            tunnel = dict()
+        )
+    )
+
+    unit = module.params['unit']
+    state = module.params['state']
+    template = module.params['template']
+    template_parameters = module.params['template_parameters']
+    endpoint = module.params['endpoint']
+    tunnel = module.params['tunnel']
+
+    units = status(module)
+    if unit in units and units[unit]['active'] == 'failed':
+        # we don't support 'failed' state
+        return module.fail_json(changed=False, msg='unit is currently in failed state')
+
+    unit_file = None
+    if template is not None:
+        template_string = open(template, 'r').read()
+        jinja_templ = Environment().from_string(template_string)
+
+        unit_file_string = jinja_templ.render(template_parameters)
+        # the filename must be the same as the unit name
+        unit_file = "/tmp/%s" % (unit)
+
+        f = open(unit_file, 'w')
+        f.write(unit_file_string)
+        f.close()
+
+    if state == 'active':
+        if unit in units:
+            if units[unit]['active'] == 'active':
+
+                if compare(module, unit, unit_file):
+                    # we are in desired state
+                    module.exit_json(changed=False, 
+                            msg="unit already active and contents have not changed",
+                            unit=unit)
+                else:
+                    # unit contents differ - destroy and start
+                    run_fleetctl(module, 'destroy', unit)
+                    sleep(1) # https://github.com/coreos/fleet/issues/467
+                    run_fleetctl(module, 'start', unit_file)
+                    wait_for(module, 'active', unit)
+
+            else:
+                # in some unknown state, start it and wait a bit
+                run_fleetctl(module, 'start', unit_file)
+                wait_for(module, 'active', unit)
+
+        else:
+            # unit is unsubmitted
+            run_fleetctl(module, 'start', unit_file)
+            wait_for(module, 'active', unit)
+
+    elif state == 'absent':
+        if unit in units:
+            run_fleetctl(module, 'destroy', unit)
+            wait_for(module, 'absent', unit)
+        else: 
+            # we are in desired state
+            module.exit_json(changed=False, msg="unit already absent")
+
+# import module snippets
+from ansible.module_utils.basic import *
+from time import sleep
+import re
+from jinja2 import Environment
+
+main()
